@@ -207,18 +207,30 @@ def _run_coro(coro):
     return box["v"]
 
 
-def _concurrent_read(store_url, zone, name, arr, sel, concurrency):
-    """Concurrently read ``arr[sel]`` from an http(s) sharded store."""
+def _concurrent_read_many(store_url, zone, requests, concurrency):
+    """Concurrently read several ``(name, arr, sel)`` windows.
+
+    All windows share one pooled HTTPS session and run under a single
+    ``asyncio.gather``, so separate variables (e.g. ``embeddings`` and
+    ``scales``) overlap instead of running back-to-back — xarray reads each
+    variable serially, and even zarr's per-shard concurrency fix does not
+    cross that variable boundary.  Returns a list of arrays in request order.
+    """
     if not store_url.startswith(("http://", "https://")):
         raise ValueError("concurrent read only supports http(s) stores")
     import aiohttp
 
-    base = f"{store_url.rstrip('/')}/{zone}/{name}"
+    base = store_url.rstrip("/")
 
     async def go():
         connector = aiohttp.TCPConnector(limit=concurrency)
         async with aiohttp.ClientSession(connector=connector) as session:
-            return await _read_window_async(base, arr, sel, concurrency, session)
+            return await asyncio.gather(
+                *(
+                    _read_window_async(f"{base}/{zone}/{name}", arr, sel, concurrency, session)
+                    for name, arr, sel in requests
+                )
+            )
 
     return _run_coro(go())
 
@@ -519,13 +531,16 @@ class TesseraAccessor:
         ti = int(np.argwhere(time_vals == year)[0][0])
         grp = _zone_group(store_url, zone)
         x_sl, y_sl = slice(xs.start, xs.stop), slice(ys.start, ys.stop)
-        emb = _concurrent_read(
-            store_url, zone, "embeddings", grp["embeddings"],
-            (ti, slice(None), y_sl, x_sl), concurrency,
-        )
-        scales = _concurrent_read(
-            store_url, zone, "scales", grp["scales"],
-            (ti, y_sl, x_sl), concurrency,
+        # Read both variables in one gathered session so embeddings and
+        # scales overlap rather than running back-to-back.
+        emb, scales = _concurrent_read_many(
+            store_url,
+            zone,
+            [
+                ("embeddings", grp["embeddings"], (ti, slice(None), y_sl, x_sl)),
+                ("scales", grp["scales"], (ti, y_sl, x_sl)),
+            ],
+            concurrency,
         )
         return emb, scales
 
