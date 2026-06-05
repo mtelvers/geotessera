@@ -21,8 +21,12 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import logging
 import math
+import struct
+import threading
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -79,6 +83,144 @@ def _zone_for_point(x: float, y: float, crs: str = "EPSG:4326") -> int:
     else:
         lon = x
     return _zone_for_lon(lon)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent partial-shard reader
+#
+# Zarr's sharding codec decodes the inner chunks of a shard serially, so a
+# small region read over a high-latency store (e.g. S3 across an ocean) pays
+# one round-trip *per inner chunk, in sequence* — tens of round-trips for a
+# 1 km box.  These helpers fetch only the inner chunks a window overlaps, but
+# issue the byte-range requests concurrently over one pooled HTTPS session,
+# collapsing N serial round-trips into ~1.  They transparently raise (and the
+# caller falls back to the plain xarray read) for any store that is not a
+# Zarr v3 sharded + blosc array reachable over http(s).
+# ---------------------------------------------------------------------------
+
+_zone_group_cache: dict = {}
+
+
+def _zone_group(store_url: str, zone: str):
+    """Open (and cache) the raw zarr group for a zone, for metadata access."""
+    key = (store_url, zone)
+    if key not in _zone_group_cache:
+        _zone_group_cache[key] = zarr.open_group(store_url, mode="r")[zone]
+    return _zone_group_cache[key]
+
+
+def _shard_params(arr):
+    """Extract sharding geometry, or raise ValueError if not fast-readable.
+
+    Returns ``(shard_shape, inner_shape, inner_grid, index_suffix_len)``.
+    """
+    m = arr.metadata.to_dict()
+    try:
+        shard = tuple(m["chunk_grid"]["configuration"]["chunk_shape"])
+        sc = next(c for c in m["codecs"] if c["name"] == "sharding_indexed")
+    except (KeyError, StopIteration):
+        raise ValueError("array is not a Zarr v3 sharded store")
+    cfg = sc["configuration"]
+    inner = tuple(cfg["chunk_shape"])
+    if not any(c["name"] == "blosc" for c in cfg["codecs"]):
+        raise ValueError("inner codec is not blosc")
+    if cfg.get("index_location", "end") != "end":
+        raise ValueError("shard index is not at end")
+    grid = tuple(s // i for s, i in zip(shard, inner))
+    has_crc = any(c["name"] == "crc32c" for c in cfg.get("index_codecs", []))
+    return shard, inner, grid, int(np.prod(grid)) * 16 + (4 if has_crc else 0)
+
+
+async def _read_window_async(base_url, arr, sel, concurrency, session):
+    """Return ``arr[sel]`` by fetching only the overlapping inner chunks.
+
+    ``sel`` is a tuple of int / slice, one entry per array dimension.
+    """
+    from numcodecs import Blosc
+
+    blosc = Blosc()
+    shard, inner, grid, idx_len = _shard_params(arr)
+    nd = arr.ndim
+    sentinel = (1 << 64) - 1
+
+    starts, stops, squeeze = [], [], []
+    for d in range(nd):
+        s = sel[d]
+        if isinstance(s, slice):
+            starts.append(0 if s.start is None else int(s.start))
+            stops.append(arr.shape[d] if s.stop is None else int(s.stop))
+            squeeze.append(False)
+        else:
+            starts.append(int(s))
+            stops.append(int(s) + 1)
+            squeeze.append(True)
+
+    out = np.zeros([stops[d] - starts[d] for d in range(nd)], dtype=arr.dtype)
+    sem = asyncio.Semaphore(concurrency)
+    tasks = []
+
+    async def fetch(url, off, ln, dst, src):
+        async with sem, session.get(url, headers={"Range": f"bytes={off}-{off + ln - 1}"}) as r:
+            raw = await r.read()
+        chunk = np.frombuffer(blosc.decode(raw), dtype=arr.dtype).reshape(inner)
+        out[dst] = chunk[src]
+
+    shard_ranges = [
+        range(starts[d] // shard[d], (stops[d] - 1) // shard[d] + 1) for d in range(nd)
+    ]
+    for sh in itertools.product(*shard_ranges):
+        url = base_url + "/c/" + "/".join(map(str, sh))
+        async with sem, session.get(url, headers={"Range": f"bytes=-{idx_len}"}) as r:
+            idx = await r.read()
+        inner_ranges = []
+        for d in range(nd):
+            base = sh[d] * shard[d]
+            lo, hi = max(starts[d], base), min(stops[d], base + shard[d])
+            inner_ranges.append(range((lo - base) // inner[d], (hi - 1 - base) // inner[d] + 1))
+        for ic in itertools.product(*inner_ranges):
+            off, ln = struct.unpack_from("<QQ", idx, int(np.ravel_multi_index(ic, grid)) * 16)
+            if off == sentinel:
+                continue  # unwritten chunk → fill_value (already zeros)
+            dst, src = [], []
+            for d in range(nd):
+                g0 = sh[d] * shard[d] + ic[d] * inner[d]
+                a, b = max(starts[d], g0), min(stops[d], g0 + inner[d])
+                dst.append(slice(a - starts[d], b - starts[d]))
+                src.append(slice(a - g0, b - g0))
+            tasks.append(fetch(url, off, ln, tuple(dst), tuple(src)))
+
+    await asyncio.gather(*tasks)
+    sq = tuple(d for d in range(nd) if squeeze[d])
+    return out.squeeze(axis=sq) if sq else out
+
+
+def _run_coro(coro):
+    """Run an async coroutine to completion from sync code, even inside a loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    box = {}
+    t = threading.Thread(target=lambda: box.setdefault("v", asyncio.run(coro)))
+    t.start()
+    t.join()
+    return box["v"]
+
+
+def _concurrent_read(store_url, zone, name, arr, sel, concurrency):
+    """Concurrently read ``arr[sel]`` from an http(s) sharded store."""
+    if not store_url.startswith(("http://", "https://")):
+        raise ValueError("concurrent read only supports http(s) stores")
+    import aiohttp
+
+    base = f"{store_url.rstrip('/')}/{zone}/{name}"
+
+    async def go():
+        connector = aiohttp.TCPConnector(limit=concurrency)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            return await _read_window_async(base, arr, sel, concurrency, session)
+
+    return _run_coro(go())
 
 
 def open_zone(
@@ -139,6 +281,11 @@ def open_zone(
         log.debug("Attached TesseraTileTransform for EPSG:%d", transform.epsg)
     except Exception as exc:
         log.debug("Could not attach tile transform: %s", exc)
+
+    # Record the source so the tessera accessor can issue concurrent
+    # partial-shard reads against the raw store (see read_region).
+    ds.attrs["geoemb:store_url"] = store_url
+    ds.attrs["geoemb:zone"] = f"utm{z:02d}"
 
     return ds
 
@@ -287,12 +434,19 @@ class TesseraAccessor:
         *,
         crs: str = "EPSG:4326",
         progress: bool = False,
+        concurrent: bool = True,
+        concurrency: int = 32,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine]:
         """Read and dequantise a bbox region.
 
         Args:
             bbox: (x_min, y_min, x_max, y_max) in the given CRS.
             crs: Input bbox CRS (default WGS84).
+            concurrent: Fetch the overlapping shard chunks concurrently
+                (default).  Dramatically faster on high-latency remote stores;
+                falls back automatically to a plain serial read if the store
+                is not an http(s) Zarr v3 sharded+blosc array.
+            concurrency: Max simultaneous range requests for the fast path.
 
         Returns ``(mosaic, transform)`` where mosaic is ``(H, W, B)``
         float32 and transform is a rasterio Affine for the window.
@@ -322,15 +476,25 @@ class TesseraAccessor:
             self._px,
         )
 
-        if progress:
-            from dask.diagnostics import ProgressBar
+        emb_int8 = scales = None
+        if concurrent and h and w:
+            try:
+                emb_int8, scales = self._read_region_concurrent(
+                    year, e_min, e_max, n_max, n_min, concurrency
+                )
+            except Exception as exc:  # noqa: BLE001 — any failure → serial fallback
+                log.debug("concurrent read unavailable (%s); using serial read", exc)
 
-            with ProgressBar():
+        if emb_int8 is None:
+            if progress:
+                from dask.diagnostics import ProgressBar
+
+                with ProgressBar():
+                    scales = sub["scales"].values
+                    emb_int8 = sub["embeddings"].values
+            else:
                 scales = sub["scales"].values
                 emb_int8 = sub["embeddings"].values
-        else:
-            scales = sub["scales"].values
-            emb_int8 = sub["embeddings"].values
 
         mosaic = self.dequantise(emb_int8, scales)
 
@@ -339,6 +503,31 @@ class TesseraAccessor:
         y0 = float(sub["y"].values[0]) + 0.5 * self._px
         transform = rasterio.transform.Affine(self._px, 0, x0, 0, -self._px, y0)
         return mosaic, transform
+
+    def _read_region_concurrent(self, year, e_min, e_max, n_max, n_min, concurrency):
+        """Fast path: concurrent partial-shard read of the integer window.
+
+        Returns ``(emb_int8 (B,H,W), scales (H,W))`` matching the serial
+        ``.values`` reads.  Raises if the store is not fast-readable; the
+        caller then falls back to the plain xarray read.
+        """
+        store_url = self._ds.attrs["geoemb:store_url"]
+        zone = self._ds.attrs["geoemb:zone"]
+        xs = self._ds.get_index("x").slice_indexer(e_min, e_max)
+        ys = self._ds.get_index("y").slice_indexer(n_max, n_min)
+        time_vals = np.asarray(self._ds.get_index("time"))
+        ti = int(np.argwhere(time_vals == year)[0][0])
+        grp = _zone_group(store_url, zone)
+        x_sl, y_sl = slice(xs.start, xs.stop), slice(ys.start, ys.stop)
+        emb = _concurrent_read(
+            store_url, zone, "embeddings", grp["embeddings"],
+            (ti, slice(None), y_sl, x_sl), concurrency,
+        )
+        scales = _concurrent_read(
+            store_url, zone, "scales", grp["scales"],
+            (ti, y_sl, x_sl), concurrency,
+        )
+        return emb, scales
 
 
 # ---------------------------------------------------------------------------
