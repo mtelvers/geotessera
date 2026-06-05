@@ -491,9 +491,7 @@ class TesseraAccessor:
         emb_int8 = scales = None
         if concurrent and h and w:
             try:
-                emb_int8, scales = self._read_region_concurrent(
-                    year, e_min, e_max, n_max, n_min, concurrency
-                )
+                emb_int8, scales = self._read_region_concurrent(sub, year, concurrency)
             except Exception as exc:  # noqa: BLE001 — any failure → serial fallback
                 log.debug("concurrent read unavailable (%s); using serial read", exc)
 
@@ -516,21 +514,27 @@ class TesseraAccessor:
         transform = rasterio.transform.Affine(self._px, 0, x0, 0, -self._px, y0)
         return mosaic, transform
 
-    def _read_region_concurrent(self, year, e_min, e_max, n_max, n_min, concurrency):
-        """Fast path: concurrent partial-shard read of the integer window.
+    def _read_region_concurrent(self, sub, year, concurrency):
+        """Fast path: concurrent partial-shard read of the selected window.
 
-        Returns ``(emb_int8 (B,H,W), scales (H,W))`` matching the serial
-        ``.values`` reads.  Raises if the store is not fast-readable; the
-        caller then falls back to the plain xarray read.
+        Derives the integer window from the already-selected ``sub`` by exact
+        coordinate value (``sub`` is a contiguous slice of the same arrays, so
+        the floats are bit-identical) — robust across xarray/pandas versions,
+        unlike ``get_index().slice_indexer()``.  Returns ``(emb_int8 (B,H,W),
+        scales (H,W))`` matching the serial reads.  Raises if the store is not
+        fast-readable; the caller then falls back to the plain xarray read.
         """
         store_url = self._ds.attrs["geoemb:store_url"]
         zone = self._ds.attrs["geoemb:zone"]
-        xs = self._ds.get_index("x").slice_indexer(e_min, e_max)
-        ys = self._ds.get_index("y").slice_indexer(n_max, n_min)
-        time_vals = np.asarray(self._ds.get_index("time"))
-        ti = int(np.argwhere(time_vals == year)[0][0])
+        xfull = np.asarray(self._ds["x"].values)
+        yfull = np.asarray(self._ds["y"].values)
+        x0 = int(np.flatnonzero(xfull == float(sub["x"].values[0]))[0])
+        y0 = int(np.flatnonzero(yfull == float(sub["y"].values[0]))[0])
+        h, w = int(sub.sizes["y"]), int(sub.sizes["x"])
+        time_vals = np.asarray(self._ds["time"].values)
+        ti = int(np.flatnonzero(time_vals == year)[0])
+        y_sl, x_sl = slice(y0, y0 + h), slice(x0, x0 + w)
         grp = _zone_group(store_url, zone)
-        x_sl, y_sl = slice(xs.start, xs.stop), slice(ys.start, ys.stop)
         # Read both variables in one gathered session so embeddings and
         # scales overlap rather than running back-to-back.
         emb, scales = _concurrent_read_many(
@@ -686,12 +690,18 @@ class GeoTesseraZarr:
         *,
         crs: str = "EPSG:4326",
         progress: bool = False,
+        concurrent: bool = True,
+        concurrency: int = 32,
     ) -> Tuple[np.ndarray, rasterio.transform.Affine, str]:
         """Read and dequantise a bbox region.
 
         Args:
             bbox: (x_min, y_min, x_max, y_max) in the given CRS.
             crs: Input bbox CRS (default WGS84).
+            concurrent: Fetch the overlapping shard chunks concurrently
+                (default); falls back to a serial read for non-http(s) or
+                non-sharded stores.  See :meth:`TesseraAccessor.read_region`.
+            concurrency: Max simultaneous range requests for the fast path.
 
         Uses the dominant UTM zone (from bbox centre).  Returns
         ``(mosaic, transform, crs)`` where mosaic is ``(H, W, B)`` float32.
@@ -702,6 +712,7 @@ class GeoTesseraZarr:
 
         ds = self.open_zone(zone=z)
         mosaic, transform = ds.tessera.read_region(
-            bbox, year, crs=crs, progress=progress
+            bbox, year, crs=crs, progress=progress,
+            concurrent=concurrent, concurrency=concurrency,
         )
         return mosaic, transform, ds.tessera.crs
