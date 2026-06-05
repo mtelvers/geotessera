@@ -118,14 +118,33 @@ def open_zone(
             raise TypeError("Provide exactly one of zone=, lon=, or bbox=")
 
     log.debug("open_zone: utm%02d from %s", z, store_url)
+    # Don't download the 1-D x/y coordinate arrays (the y array alone is ~8 MB,
+    # stored uncompressed) — they are exactly the regular grid, so recompute
+    # them from the stored affine below.  Reading them to resolve a small
+    # window is pure overhead, and dominates wall time on bandwidth-limited
+    # links.
+    drop = set(kwargs.pop("drop_variables", ()) or ())
+    drop |= {"x", "y"}
     ds = xr.open_zarr(
         store_url,
         group=f"utm{z:02d}",
         zarr_format=3,
         consolidated=True,
         chunks=SHARD_CHUNKS,
+        drop_variables=tuple(drop),
         **kwargs,
     )
+
+    # Reconstruct the x/y pixel-centre coordinates from the affine.  These are
+    # bit-identical to the stored arrays (which are the regular grid) but cost
+    # zero I/O, so .sel(x=..., y=...) still works against an in-memory index.
+    t = ds.attrs.get("spatial:transform")
+    if t is not None and "x" in ds.dims and "y" in ds.dims:
+        a, _b, c0, _d, e, f0 = (float(v) for v in t[:6])
+        ds = ds.assign_coords(
+            x=("x", c0 + (np.arange(ds.sizes["x"]) + 0.5) * a),
+            y=("y", f0 + (np.arange(ds.sizes["y"]) + 0.5) * e),
+        )
 
     # Attach computed piecewise tile transform — reproduces the tile
     # generation geometry (0.1° WGS84 → UTM projection) to compute
