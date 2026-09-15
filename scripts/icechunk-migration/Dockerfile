@@ -5,7 +5,7 @@ RUN apt-get update -qq \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/* \
     && uv tool install --no-cache \
-       "geotessera[migration] @ git+https://github.com/avsm/geotessera.git@f695b9412ea304f6b6bdd7149f4f8cca0e5b6216"
+       "geotessera[migration] @ git+https://github.com/mtelvers/geotessera.git@09f5cd1386e4ae61ab5e564e98d3a497753a87ac"
 
 ENV PATH="/root/.local/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
