@@ -729,7 +729,6 @@ class Migration:
             and max_seconds <= 0
         ):
             raise ValueError("Invalid shard/runtime limit")
-        check_worker_memory(workers, self.shard_size)
         from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
         started, written = time.monotonic(), 0
@@ -1196,45 +1195,6 @@ def coordinate_data(doc, name):
     if name in doc["static"]:
         return np.array(doc["static"][name]["data"], dtype=doc["static"][name]["dtype"])
     return None
-
-
-def check_worker_memory(workers, shard_size):
-    """Respect container limits, including reclaimable spill pages.
-
-    Six times the raw embedding/scales buffer allows for dense source reads,
-    codec buffers and upload copies; spilling does not remove cgroup limits.
-    """
-    import os
-
-    limits = []
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    limits.append(int(line.split()[1]) * 1024)
-    except OSError:
-        try:
-            limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
-        except (AttributeError, OSError, ValueError):
-            pass
-    for maximum, current in (
-        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
-        (
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-        ),
-    ):
-        try:
-            limits.append(
-                int(Path(maximum).read_text()) - int(Path(current).read_text())
-            )
-        except (OSError, ValueError):
-            pass
-    required = workers * 6 * 132 * shard_size**2
-    if limits and required > min(limits) * 0.85:
-        raise ValueError(
-            f"{workers} workers require approximately {required / 2**30:.1f} GiB plus headroom; reduce workers/shard size or increase container memory"
-        )
 
 
 def _check_array(array, config):
