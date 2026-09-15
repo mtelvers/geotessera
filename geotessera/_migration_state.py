@@ -55,6 +55,15 @@ def s3_client(options=None):
     options = options or {}
     config = dict(options.get("config_kwargs", {}))
     config.setdefault("retries", {"mode": "adaptive", "max_attempts": 10})
+    # One State client is shared by every worker thread and by the 16-way scan
+    # pool, but botocore pools only 10 connections per client: the surplus has
+    # its connection discarded and reopened, paying a TLS handshake per
+    # request. Same default and environment variable as the fsspec pool in
+    # remote.py, so both are raised together.
+    config.setdefault(
+        "max_pool_connections",
+        int(os.environ.get("GEOTESSERA_MAX_POOL_CONNECTIONS", "32")),
+    )
     if options.get("anon"):
         config["signature_version"] = UNSIGNED
     kwargs = dict(options.get("client_kwargs", {}))
