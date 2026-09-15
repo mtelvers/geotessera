@@ -1155,9 +1155,22 @@ class AuditStore(zarr.storage.WrapperStore):
         self.deleted = set()
 
     async def set(self, key, value):
-        checksum = digest(memoryview(value.as_numpy_array()))
-        await self._store.set(key, value)
-        self.hashes[key] = checksum
+        # Every worker thread's store traffic is funnelled onto Zarr's single
+        # global event loop thread, so anything synchronous here stalls every
+        # other worker's reads and writes as well. sha256 over a 2 GiB encoded
+        # shard is ~10s of CPU: hand it to a worker thread and overlap it with
+        # the upload instead of running it, inline, ahead of the upload.
+        # Both sides only read the buffer, and Zarr does not reuse it once it
+        # has been handed to `set`.
+        checksum = asyncio.ensure_future(
+            asyncio.to_thread(digest, memoryview(value.as_numpy_array()))
+        )
+        try:
+            await self._store.set(key, value)
+        except BaseException:
+            checksum.cancel()
+            raise
+        self.hashes[key] = await checksum
         self.deleted.discard(key)
 
     async def delete(self, key):
