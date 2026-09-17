@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import math
+import os
 import re
 import signal
 import tempfile
@@ -339,6 +340,19 @@ class Migration:
         self._object_index = None
         self._completion_invalidated = False
         self._invalidation_lock = threading.Lock()
+        # Hemisphere-seam conflict handling (mtelvers fork). "error" (default)
+        # keeps upstream behaviour: abort on any N/S disagreement at the
+        # equatorial overlap. "north"/"south" instead keep that hemisphere's
+        # values, emit a seam_conflict event, and continue -- so the migration
+        # can complete despite known upstream source-data inconsistencies. The
+        # logged seam_conflict events are the exact redo manifest once the data
+        # is fixed upstream (reported to dClimate).
+        self.seam_conflict = os.environ.get("GEOTESSERA_SEAM_CONFLICT", "error")
+        if self.seam_conflict not in ("error", "north", "south"):
+            raise ValueError(
+                "GEOTESSERA_SEAM_CONFLICT must be one of error, north, south; "
+                f"got {self.seam_conflict!r}"
+            )
 
     @property
     def source(self):
@@ -917,6 +931,15 @@ class Migration:
                     if isinstance(a, np.memmap):
                         a._mmap.close()
 
+    def _hemi_wins(self, group_name):
+        """Under seam_conflict=north/south, whether this hemisphere group's
+        values win at the equatorial overlap (robust to N/S write order)."""
+        if self.seam_conflict == "north":
+            return str(group_name).endswith("N")
+        if self.seam_conflict == "south":
+            return str(group_name).endswith("S")
+        return True
+
     def _assemble_into(self, doc, name, unit, values, occupied, read_rows):
         year, row, col = unit
         r0, c0 = row * self.shard_size, col * self.shard_size
@@ -966,9 +989,23 @@ class Migration:
                     seen = occupied[out_slices["y"], out_slices["x"]]
                     conflict = seen & nonfill & np.any(view[0] != data[0], axis=0)
                     if conflict.any():
-                        raise ValueError(
-                            f"Conflicting hemisphere embeddings: zone={doc['zone']} unit={unit}"
+                        if self.seam_conflict == "error":
+                            raise ValueError(
+                                f"Conflicting hemisphere embeddings: zone={doc['zone']} unit={unit}"
+                            )
+                        event(
+                            "seam_conflict",
+                            zone=doc["zone"],
+                            year=year,
+                            row=row,
+                            col=col,
+                            array=name,
+                            group=g["name"],
+                            pixels=int(conflict.sum()),
+                            resolution=self.seam_conflict,
                         )
+                        if not self._hemi_wins(g["name"]):
+                            nonfill = nonfill & ~seen
                     np.copyto(view[0], data[0], where=nonfill[None])
                 else:
                     fill = source.fill_value(spec["fill"])
@@ -983,10 +1020,25 @@ class Migration:
                         if data.dtype.kind == "f"
                         else view == data
                     )
-                    if np.any(seen & nonfill & ~equal):
-                        raise ValueError(
-                            f"Conflicting hemisphere {name}: zone={doc['zone']} unit={unit}"
+                    conflict = seen & nonfill & ~equal
+                    if np.any(conflict):
+                        if self.seam_conflict == "error":
+                            raise ValueError(
+                                f"Conflicting hemisphere {name}: zone={doc['zone']} unit={unit}"
+                            )
+                        event(
+                            "seam_conflict",
+                            zone=doc["zone"],
+                            year=year,
+                            row=row,
+                            col=col,
+                            array=name,
+                            group=g["name"],
+                            pixels=int(np.sum(conflict)),
+                            resolution=self.seam_conflict,
                         )
+                        if not self._hemi_wins(g["name"]):
+                            nonfill = nonfill & ~seen
                     np.copyto(view, data, where=nonfill)
                 seen |= nonfill
 
