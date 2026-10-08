@@ -1,3 +1,16 @@
+## Unreleased
+
+- `zarr-fill --rewrite-existing-shards` no longer follows every zone/year
+  with a serial re-read of the shards it has just written to rebuild the
+  stretch statistics. The writers report statistics for the shards they
+  write, any shard the rewrite leaves alone is read back through the same
+  process pool, and the slot is set from the lot in one pass. A fill that
+  finds a slot marked incomplete repairs it the same way.
+  `--backfill-stretch-stats` now reads shards through the worker pool too,
+  honours `--workers`, logs progress with an ETA, and leaves the slot
+  marked incomplete rather than raising from part-way if a read fails.
+  (@mtelvers)
+
 ## v0.11.0 (04-10-2026)
 
 Wall-to-wall v1.1 embeddings are now available by default!  GeoTessera now

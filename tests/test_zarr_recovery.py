@@ -336,6 +336,84 @@ def test_rewritten_shards_replace_stretch_statistics(tiny_store):
     assert int(tiny_store.group["stretch_stats_count"][0]) == 32
 
 
+def test_rewrite_rebuilds_statistics_without_backfill_scan(tiny_store, monkeypatch):
+    """A rewrite folds the writers' own statistics; no second read of the zone."""
+    assert _fill(tiny_store) == 2
+    np.save(tiny_store.scales, np.full((4, 8), 0.5, dtype="f4"))
+
+    def no_backfill(*args, **kwargs):
+        raise AssertionError("rewrite must not fall back to backfill_stretch_stats")
+
+    catchups = []
+    catchup = build._stats_catchup_worker
+    monkeypatch.setattr(build, "backfill_stretch_stats", no_backfill)
+    monkeypatch.setattr(
+        build, "_stats_catchup_worker", lambda c: catchups.append(c) or catchup(c)
+    )
+    assert _fill(tiny_store, skip_existing_shards=False) == 2
+    assert catchups == []
+    group = tiny_store.group
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 16.0)
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], 1)
+    assert int(group["stretch_sample_count"][0]) > 0
+
+
+def test_rewrite_reads_back_shards_it_does_not_touch(tiny_store, monkeypatch):
+    """Shards in the store outside the rewrite are read, not forgotten."""
+    assert _fill(tiny_store) == 2
+    # Only the first shard is rewritten; the second stays as the store has it.
+    monkeypatch.setattr(
+        build,
+        "build_shard_index",
+        lambda tiles, grid, t: [s for s in tiny_store.specs if s.sc == 0],
+    )
+    np.save(tiny_store.scales, np.full((4, 8), 0.5, dtype="f4"))
+    catchups = []
+    catchup = build._stats_catchup_worker
+    monkeypatch.setattr(
+        build, "_stats_catchup_worker", lambda c: catchups.append(c) or catchup(c)
+    )
+    assert _fill(tiny_store, skip_existing_shards=False) == 1
+    assert catchups == [(0, 1)]
+    group = tiny_store.group
+    assert int(group["stretch_stats_count"][0]) == 32
+    # 16 px at 0.5 (rewritten) + 16 px at 0.25 (read back), per band.
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 16 * 0.5 + 16 * 0.25)
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], 1)
+
+
+def test_interrupted_rebuild_resumes_by_reading_the_store(tiny_store, monkeypatch):
+    """A slot left at -1 is rebuilt on the next fill from what is in the store."""
+    assert _fill(tiny_store) == 2
+    tiny_store.group["stretch_stats_count"][0] = -1
+    tiny_store.group["stretch_stats_sum"][0] = 1e9
+    catchups = []
+    catchup = build._stats_catchup_worker
+    monkeypatch.setattr(
+        build, "_stats_catchup_worker", lambda c: catchups.append(c) or catchup(c)
+    )
+    assert _fill(tiny_store) == 0
+    assert sorted(catchups) == [(0, 0), (0, 1)]
+    assert int(tiny_store.group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(tiny_store.group["stretch_stats_sum"][0], 8.0)
+
+
+def test_backfill_leaves_slot_incomplete_when_a_read_fails(tiny_store, monkeypatch):
+    assert _fill(tiny_store) == 2
+    with monkeypatch.context() as failure:
+
+        def fail_catchup(coord):
+            raise OSError("injected statistics read failure")
+
+        failure.setattr(build, "_stats_catchup_worker", fail_catchup)
+        with pytest.raises(RuntimeError, match="shard read\\(s\\) failed"):
+            build.backfill_stretch_stats(tiny_store.location, zones=[31])
+    assert int(tiny_store.group["stretch_stats_count"][0]) == -1
+    assert build.backfill_stretch_stats(tiny_store.location, zones=[31]) == 1
+    assert int(tiny_store.group["stretch_stats_count"][0]) == 32
+
+
 def test_rewrite_without_stats_invalidates_then_rebuilds(tiny_store):
     _fill(tiny_store)
     np.save(tiny_store.scales, np.full((4, 8), 0.5, dtype="f4"))

@@ -4466,6 +4466,7 @@ def zarr_fill_command(args):
                 years=years,
                 console=console,
                 storage_options=store_options,
+                workers=args.workers,
             )
         except (ValueError, RuntimeError) as e:
             console.print(f"[red]{emoji('❌ ')}{e}[/red]")
