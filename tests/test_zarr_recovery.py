@@ -68,8 +68,28 @@ def tiny_store(tmp_path, monkeypatch, request):
     )
 
     def serial_writes(**kwargs):
-        """Use the real workers while replacing only process scheduling."""
+        """Use the real workers while replacing only process scheduling.
+
+        Honours ``on_stats``/``flush_every`` the way the pool does: results
+        are handed over in batches as they are produced, so a failure
+        part-way leaves the earlier batches folded.
+        """
         written, failed, statistics = 0, set(), []
+        on_stats = kwargs.get("on_stats")
+        flush_every = max(1, kwargs.get("flush_every", 64))
+        pending = []
+
+        def produced(result):
+            if not isinstance(result, dict):
+                return
+            if on_stats is None:
+                statistics.append(result)
+                return
+            pending.append(result)
+            if len(pending) >= flush_every:
+                on_stats(list(pending))
+                pending.clear()
+
         for spec in kwargs["shard_specs"]:
             try:
                 result = build._write_one_shard(
@@ -80,8 +100,7 @@ def tiny_store(tmp_path, monkeypatch, request):
                     use_landmask=False,
                 )
                 written += bool(result)
-                if isinstance(result, dict):
-                    statistics.append(result)
+                produced(result)
             except OSError:
                 failed.add((spec.sr, spec.sc))
         monkeypatch.setattr(build, "_worker_store", group)
@@ -89,9 +108,11 @@ def tiny_store(tmp_path, monkeypatch, request):
         monkeypatch.setattr(build, "_worker_sample_cap", kwargs["sample_cap"])
         for coord in kwargs.get("stats_coords") or []:
             try:
-                statistics.append(build._stats_catchup_worker(coord))
+                produced(build._stats_catchup_worker(coord))
             except OSError:
                 failed.add(coord)
+        if pending:
+            on_stats(list(pending))
         return written, failed, statistics
 
     monkeypatch.setattr(build, "_write_shards", serial_writes)
@@ -461,6 +482,32 @@ def test_backfill_restarts_when_resume_state_is_invalid(tiny_store, monkeypatch)
     assert sorted(catchups) == [(0, 0), (0, 1)]
     assert int(group["stretch_stats_count"][0]) == 32
     assert not tiny_store.location.state.exists(*marker)
+
+
+def test_writer_stats_are_folded_as_they_arrive(tiny_store, monkeypatch):
+    """A fill killed mid-way keeps the statistics of the shards it wrote."""
+    group = tiny_store.group
+    real_write = build._write_one_shard
+
+    def write_or_die(spec, *args, **kwargs):
+        if spec.sc == 1:
+            raise OSError("injected write failure")
+        return real_write(spec, *args, **kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(build, "_write_one_shard", write_or_die)
+        with pytest.raises(RuntimeError, match="1 shard\\(s\\) failed"):
+            _fill(tiny_store, stats_batch_size=1)
+    # The first shard's statistics were folded before the second failed.
+    assert int(group["stretch_stats_count"][0]) == 16
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], [[1, 0]])
+
+    # The retry writes the missing shard only and reads nothing back.
+    catchups = _record_catchups(monkeypatch)
+    assert _fill(tiny_store) == 1
+    assert catchups == []
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 8.0)
 
 
 def test_fill_catchup_resumes_in_batches(tiny_store, monkeypatch):

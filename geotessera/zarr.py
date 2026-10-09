@@ -55,7 +55,16 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 
@@ -2359,11 +2368,26 @@ def fold_shard_stats(
     return n
 
 
-# Shards read back per pool run when catching statistics up from the
-# store. Each batch is folded as soon as it is in, so an interrupted run
-# loses at most this many reads. A pool start costs a few seconds, which
-# at this size is a small fraction of the reads it fronts.
+# Per-shard results folded into the store per batch, as the pool produces
+# them. A run killed part-way has lost at most this many shards' worth of
+# statistics; everything folded earlier is in the store and masked. Each
+# fold is a read-modify-write of a few small chunks, so the batch keeps
+# that cost well below the reads and writes it fronts.
 STATS_BATCH_SHARDS = 64
+
+
+class _StatsFolder:
+    """``on_stats`` callback for the pool: fold each batch, count pixels."""
+
+    def __init__(self, group: "zarr.Group", time_index: int):
+        self.group = group
+        self.time_index = time_index
+        self.pixels = 0
+        self.shards = 0
+
+    def __call__(self, shard_stats: List[Dict[str, Any]]) -> None:
+        self.pixels += fold_shard_stats(self.group, self.time_index, shard_stats)
+        self.shards += len(shard_stats)
 
 
 def _catch_up_stretch_stats(
@@ -2378,34 +2402,31 @@ def _catch_up_stretch_stats(
     console: Optional["rich.console.Console"],
     batch_size: int = STATS_BATCH_SHARDS,
 ) -> Tuple[set, int]:
-    """Read *coords* back from the store and fold them, a batch at a time.
+    """Read *coords* back from the store and fold them as they arrive.
 
-    Each batch's results are folded before the next is read, so the slot
-    is valid, and the mask current, between batches. A run killed at any
-    point is resumed by computing the unseen set again. A failed read
+    Results are folded in batches while the pool is still reading, so the
+    slot is valid, and the mask current, at every point. A run killed at
+    any point is resumed by computing the unseen set again. A failed read
     leaves its shard unmasked for the next run and does not stop the rest.
 
     Returns (failed coords, pixels folded).
     """
-    failed: set = set()
-    n_px = 0
-    for start in range(0, len(coords), max(1, batch_size)):
-        batch = coords[start : start + batch_size]
-        _, batch_failed, shard_stats = _write_shards(
-            store=store,
-            zone_group=zone_group,
-            shard_specs=[],
-            workers=workers,
-            source_options=None,
-            label=f"{label} stats {start + len(batch)}/{len(coords)}",
-            console=console,
-            sample_cap=sample_cap,
-            stats_coords=batch,
-            time_index=time_index,
-        )
-        failed |= batch_failed
-        n_px += fold_shard_stats(group, time_index, shard_stats)
-    return failed, n_px
+    folder = _StatsFolder(group, time_index)
+    _, failed, _ = _write_shards(
+        store=store,
+        zone_group=zone_group,
+        shard_specs=[],
+        workers=workers,
+        source_options=None,
+        label=f"{label} stats",
+        console=console,
+        sample_cap=sample_cap,
+        stats_coords=coords,
+        time_index=time_index,
+        on_stats=folder,
+        flush_every=batch_size,
+    )
+    return failed, folder.pixels
 
 
 # ---------------------------------------------------------------------------
@@ -3867,29 +3888,15 @@ def fill_store(
                     + f" ({workers} workers)"
                 )
 
-            # Reads first: they are the resumable half. The writes resume
-            # through skip-existing on their own.
-            failed: set = set()
-            if catch_up:
-                failed, n_px = _catch_up_stretch_stats(
-                    store,
-                    zone_group,
-                    zone_rw,
-                    time_index,
-                    catch_up,
-                    workers,
-                    sample_cap,
-                    label=f"    Zone {zone_num} y{fill_year}",
-                    console=console,
-                    batch_size=stats_batch_size,
-                )
-                if console:
-                    console.print(
-                        f"    [dim]Stretch stats: {n_px:,} pixels caught up "
-                        f"from {len(catch_up) - len(failed):,} shard(s)[/dim]"
-                    )
-
-            written_count, write_failed, shard_stats = _write_shards(
+            # Statistics from writes and catch-up reads alike are folded
+            # into the store in batches while the pool runs, so an evicted
+            # task has lost at most one batch of them. A failed shard is
+            # absent from the mask, whether its write or its read failed,
+            # so the next run picks it up; what succeeded stays folded.
+            folder = (
+                _StatsFolder(zone_rw, time_index) if collect_stretch_stats else None
+            )
+            written_count, failed, _ = _write_shards(
                 store=store,
                 zone_group=zone_group,
                 shard_specs=shard_specs,
@@ -3899,24 +3906,22 @@ def fill_store(
                 console=console,
                 spill_dir=spill_dir,
                 sample_cap=sample_cap,
+                stats_coords=catch_up,
                 time_index=time_index,
                 depths=depths,
                 use_landmask=use_landmask,
+                on_stats=folder,
+                flush_every=stats_batch_size,
             )
-            failed |= write_failed
 
             total_shards_written += written_count
             total_shards_failed += len(failed)
 
-            # A failed shard is absent from the mask, whether its write or
-            # its read failed, so the next run picks it up; what succeeded
-            # is folded now and stays folded.
-            if collect_stretch_stats and shard_stats:
-                n_px = fold_shard_stats(zone_rw, time_index, shard_stats)
-                if console:
-                    console.print(
-                        f"    [dim]Stretch stats: {n_px:,} pixels folded in[/dim]"
-                    )
+            if folder is not None and folder.shards and console:
+                console.print(
+                    f"    [dim]Stretch stats: {folder.pixels:,} pixels from "
+                    f"{folder.shards:,} shard(s) folded in[/dim]"
+                )
 
             if console:
                 console.print(
@@ -3963,6 +3968,8 @@ def _write_shards(
     time_index: int = 0,
     depths: Sequence[int] = (),
     use_landmask: bool = True,
+    on_stats: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    flush_every: int = STATS_BATCH_SHARDS,
 ) -> Tuple[int, set, List[Dict[str, Any]]]:
     """Run shard writes — and stats catch-up reads — through a process pool.
 
@@ -3971,8 +3978,15 @@ def _write_shards(
     shape as a write's. Failed writes and catch-up reads both fail the fill;
     neither marks its shard in the mask, so a retry picks it up.
 
+    With ``on_stats``, per-shard statistics are handed over in batches of
+    ``flush_every`` as results arrive, and again for the remainder at the
+    end, instead of being returned. The caller folds each batch into the
+    store at once, so a run killed mid-way has lost at most one batch of
+    work rather than everything the pool had produced.
+
     Returns (shards written, set of failed (sr, sc) coordinates, per-shard
-    stretch statistics from both task kinds).
+    stretch statistics from both task kinds — empty when ``on_stats`` takes
+    them).
     """
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -3980,7 +3994,9 @@ def _write_shards(
     written_count = 0
     failed: set = set()
     stats_results: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
     stats_coords = stats_coords or []
+    flush_every = max(1, flush_every)
     initargs = (
         store.url,
         zone_group,
@@ -4017,7 +4033,13 @@ def _write_shards(
                 if kind == "write" and result:
                     written_count += 1
                 if isinstance(result, dict):
-                    stats_results.append(result)
+                    if on_stats is None:
+                        stats_results.append(result)
+                    else:
+                        pending.append(result)
+                        if len(pending) >= flush_every:
+                            on_stats(pending)
+                            pending.clear()
             except Exception as e:
                 if kind == "write":
                     logger.warning(f"Shard ({item.sr},{item.sc}) failed: {e}")
@@ -4027,11 +4049,16 @@ def _write_shards(
                     failed.add(item)
             if advance is not None:
                 advance()
+        if pending:
+            on_stats(pending)
+            pending.clear()
 
     # Not a `with` block: on Ctrl-C the context manager's shutdown(wait=True)
     # blocks until every in-flight shard finishes, which with a pool of
     # multi-gigabyte workers looks like a hang and invites a second Ctrl-C
-    # (and a second traceback). Cancel what has not started and leave.
+    # (and a second traceback). Cancel what has not started and leave. The
+    # same goes for a fold that fails: the store is where it failed, and
+    # the shards still in flight have nowhere to report to.
     pool = ProcessPoolExecutor(
         max_workers=workers,
         initializer=_init_shard_worker,
@@ -4041,7 +4068,7 @@ def _write_shards(
     try:
         progress = _ProgressLog(label, len(shard_specs) + len(stats_coords))
         _drain(pool, advance=progress.advance)
-    except KeyboardInterrupt:
+    except BaseException:
         pool.shutdown(wait=False, cancel_futures=True)
         raise
     else:

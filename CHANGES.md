@@ -9,15 +9,19 @@
   `--backfill-stretch-stats` now reads shards through the worker pool too,
   honours `--workers` and logs progress with an ETA. (@mtelvers)
 
-- Rebuilding stretch statistics is resumable. Shards read back from the
-  store are folded a batch at a time (`--stats-batch-size`, default 64),
-  so a fill or backfill killed part-way loses at most one batch and the
-  next run reads only the shards the coverage mask has not seen. A failed
-  read no longer marks the whole slot incomplete; the shard is simply read
-  again next time. `--backfill-stretch-stats` records a marker beside the
-  store while it runs and continues from it on a retry, so a Fargate-style
-  retry of the same command never restarts a zone-year from zero.
-  (@mtelvers)
+- Stretch statistics are folded into the store as the worker pool produces
+  them, in batches (`--stats-batch-size`, default 64), for shards being
+  written and for shards read back alike. A fill or backfill killed
+  part-way loses at most one batch; everything folded earlier stays in
+  the store, and the next run writes only the missing shards and reads
+  back only the shards the coverage mask has not seen. Previously a fill
+  held every shard's statistics in memory until the zone-year finished,
+  so an eviction meant reading all of its shards back from the store. A
+  failed read or write no longer marks the whole slot incomplete; the
+  shard is simply picked up next time. `--backfill-stretch-stats` records
+  a marker beside the store while it runs and continues from it on a
+  retry, so a Fargate-style retry of the same command never restarts a
+  zone-year from zero. (@mtelvers)
 
 ## v0.11.0 (04-10-2026)
 
