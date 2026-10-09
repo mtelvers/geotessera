@@ -7,8 +7,16 @@
   process pool, and the slot is set from the lot in one pass. A fill that
   finds a slot marked incomplete repairs it the same way.
   `--backfill-stretch-stats` now reads shards through the worker pool too,
-  honours `--workers`, logs progress with an ETA, and leaves the slot
-  marked incomplete rather than raising from part-way if a read fails.
+  honours `--workers` and logs progress with an ETA. (@mtelvers)
+
+- Rebuilding stretch statistics is resumable. Shards read back from the
+  store are folded a batch at a time (`--stats-batch-size`, default 64),
+  so a fill or backfill killed part-way loses at most one batch and the
+  next run reads only the shards the coverage mask has not seen. A failed
+  read no longer marks the whole slot incomplete; the shard is simply read
+  again next time. `--backfill-stretch-stats` records a marker beside the
+  store while it runs and continues from it on a retry, so a Fargate-style
+  retry of the same command never restarts a zone-year from zero.
   (@mtelvers)
 
 ## v0.11.0 (04-10-2026)

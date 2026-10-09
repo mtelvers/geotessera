@@ -87,7 +87,7 @@ def tiny_store(tmp_path, monkeypatch, request):
         monkeypatch.setattr(build, "_worker_store", group)
         monkeypatch.setattr(build, "_worker_time_index", kwargs["time_index"])
         monkeypatch.setattr(build, "_worker_sample_cap", kwargs["sample_cap"])
-        for coord in kwargs["stats_coords"]:
+        for coord in kwargs.get("stats_coords") or []:
             try:
                 statistics.append(build._stats_catchup_worker(coord))
             except OSError:
@@ -399,19 +399,86 @@ def test_interrupted_rebuild_resumes_by_reading_the_store(tiny_store, monkeypatc
     np.testing.assert_array_equal(tiny_store.group["stretch_stats_sum"][0], 8.0)
 
 
-def test_backfill_leaves_slot_incomplete_when_a_read_fails(tiny_store, monkeypatch):
-    assert _fill(tiny_store) == 2
-    with monkeypatch.context() as failure:
+def _record_catchups(monkeypatch, fail=()):
+    """Spy on catch-up reads; coords in *fail* raise instead of reading."""
+    seen = []
+    real = build._stats_catchup_worker
 
-        def fail_catchup(coord):
+    def spy(coord):
+        seen.append(coord)
+        if coord in fail:
             raise OSError("injected statistics read failure")
+        return real(coord)
 
-        failure.setattr(build, "_stats_catchup_worker", fail_catchup)
-        with pytest.raises(RuntimeError, match="shard read\\(s\\) failed"):
-            build.backfill_stretch_stats(tiny_store.location, zones=[31])
-    assert int(tiny_store.group["stretch_stats_count"][0]) == -1
+    monkeypatch.setattr(build, "_stats_catchup_worker", spy)
+    return seen
+
+
+def test_backfill_resumes_after_a_failed_read(tiny_store, monkeypatch):
+    """Folded batches stay folded; a retry reads only what is left."""
+    assert _fill(tiny_store) == 2
+    group = tiny_store.group
+    marker = build._stretch_backfill_marker_parts("utm31", 2024)
+    with monkeypatch.context() as failure:
+        _record_catchups(failure, fail={(0, 1)})
+        with pytest.raises(RuntimeError, match="1 shard read\\(s\\) failed"):
+            build.backfill_stretch_stats(tiny_store.location, zones=[31], batch_size=1)
+    # The first shard's batch was folded before the second failed.
+    assert int(group["stretch_stats_count"][0]) == 16
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], [[1, 0]])
+    assert tiny_store.location.state.exists(*marker)
+
+    catchups = _record_catchups(monkeypatch)
     assert build.backfill_stretch_stats(tiny_store.location, zones=[31]) == 1
-    assert int(tiny_store.group["stretch_stats_count"][0]) == 32
+    assert catchups == [(0, 1)]
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 8.0)
+    np.testing.assert_array_equal(group["stretch_stats_shards"][0], 1)
+    assert not tiny_store.location.state.exists(*marker)
+
+
+def test_backfill_without_marker_starts_from_empty(tiny_store, monkeypatch):
+    """No marker means a fresh repair: the old sums are discarded."""
+    assert _fill(tiny_store) == 2
+    group = tiny_store.group
+    group["stretch_stats_sum"][0] = 1e9
+    catchups = _record_catchups(monkeypatch)
+    assert build.backfill_stretch_stats(tiny_store.location, zones=[31]) == 1
+    assert sorted(catchups) == [(0, 0), (0, 1)]
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 8.0)
+
+
+def test_backfill_restarts_when_resume_state_is_invalid(tiny_store, monkeypatch):
+    """A marker beside a slot at -1 cannot be continued from."""
+    assert _fill(tiny_store) == 2
+    group = tiny_store.group
+    marker = build._stretch_backfill_marker_parts("utm31", 2024)
+    tiny_store.location.state.write_bytes(b"", *marker)
+    group["stretch_stats_count"][0] = -1
+    catchups = _record_catchups(monkeypatch)
+    assert build.backfill_stretch_stats(tiny_store.location, zones=[31]) == 1
+    assert sorted(catchups) == [(0, 0), (0, 1)]
+    assert int(group["stretch_stats_count"][0]) == 32
+    assert not tiny_store.location.state.exists(*marker)
+
+
+def test_fill_catchup_resumes_in_batches(tiny_store, monkeypatch):
+    """An emptied slot is caught up a batch at a time by ordinary fills."""
+    assert _fill(tiny_store) == 2
+    group = tiny_store.group
+    build.reset_zone_stretch_stats(group, 0)
+    assert int(group["stretch_stats_count"][0]) == 0
+    with monkeypatch.context() as failure:
+        _record_catchups(failure, fail={(0, 1)})
+        with pytest.raises(RuntimeError, match="1 shard\\(s\\) failed"):
+            _fill(tiny_store, stats_batch_size=1)
+    assert int(group["stretch_stats_count"][0]) == 16
+    catchups = _record_catchups(monkeypatch)
+    assert _fill(tiny_store) == 0
+    assert catchups == [(0, 1)]
+    assert int(group["stretch_stats_count"][0]) == 32
+    np.testing.assert_array_equal(group["stretch_stats_sum"][0], 8.0)
 
 
 def test_rewrite_without_stats_invalidates_then_rebuilds(tiny_store):
@@ -437,18 +504,17 @@ def test_failed_stats_update_rebuilds_on_retry(tiny_store, monkeypatch):
     np.testing.assert_array_equal(tiny_store.group["stretch_stats_sum"][0], 8.0)
 
 
-def test_failed_stats_catchup_invalidates_then_rebuilds(tiny_store, monkeypatch):
+def test_failed_stats_catchup_keeps_what_was_read(tiny_store, monkeypatch):
     _fill(tiny_store, collect_stretch_stats=False)
     with monkeypatch.context() as failure:
-
-        def fail_catchup(coord):
-            raise OSError("injected statistics read failure")
-
-        failure.setattr(build, "_stats_catchup_worker", fail_catchup)
-        with pytest.raises(RuntimeError, match="2 shard\\(s\\) failed"):
+        _record_catchups(failure, fail={(0, 1)})
+        with pytest.raises(RuntimeError, match="1 shard\\(s\\) failed"):
             _fill(tiny_store)
-    assert int(tiny_store.group["stretch_stats_count"][0]) == -1
+    # The read that succeeded is folded; the slot stays valid and partial.
+    assert int(tiny_store.group["stretch_stats_count"][0]) == 16
+    catchups = _record_catchups(monkeypatch)
     assert _fill(tiny_store) == 0
+    assert catchups == [(0, 1)]
     assert int(tiny_store.group["stretch_stats_count"][0]) == 32
 
 
