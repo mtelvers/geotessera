@@ -1664,6 +1664,77 @@ def _compute_zone_grid_from_landmask(
     )
 
 
+def _compute_zone_grid_deterministic(
+    zone: int,
+    years: List[int],
+) -> UnifiedZoneGrid:
+    """Deterministic grid for a UTM zone, sized to the zone's canonical
+    footprint rather than to the tiles that happen to be present.
+
+    The extent is the zone's 6-degree longitude band across the whole globe
+    (-90..90 latitude), projected to the zone's canonical (northern) UTM CRS
+    and snapped to ``SHARD_SIZE`` -- the same snapping as
+    :func:`_compute_zone_grid_from_landmask`; only the input extent differs.
+
+    Because it depends on nothing but the zone number, the grid never changes
+    as tiles are added or removed, so a tile delivered anywhere in the zone
+    lands inside the existing arrays and an update is a pure incremental fill,
+    never a full regenerate. Empty shards cost nothing -- sharded storage with
+    skip-existing never writes an all-nodata shard. The 6-degree band keeps
+    every point within 3 degrees of the central meridian, so the Transverse
+    Mercator projection stays well-behaved right to the poles (a whole-zone
+    grid comes to ~17x489 shards, almost all of it never written).
+    """
+    import numpy as np
+    from pyproj import Transformer
+
+    epsg = zone_canonical_epsg(zone)
+    pixel_size = 10.0
+    proj = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+
+    # The zone's 6-degree band, widened by a tile half-width (0.05 deg) so the
+    # corners of edge tiles sit inside the grid; longitude clamped to valid range.
+    lon_w = max(-180.0, -180.0 + (zone - 1) * 6.0 - 0.05)
+    lon_e = min(180.0, -180.0 + zone * 6.0 + 0.05)
+
+    # Dense sampling of the footprint captures the UTM extremes (widest easting
+    # near the equator, northing at the latitude limits). 361x361 is ample for a
+    # 6-degree band; non-finite projections at the far edges are dropped.
+    lons = np.linspace(lon_w, lon_e, 361)
+    lats = np.linspace(-90.0, 90.0, 361)
+    grid_lon, grid_lat = np.meshgrid(lons, lats)
+    xs, ys = proj.transform(grid_lon.ravel(), grid_lat.ravel())
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    finite = np.isfinite(xs) & np.isfinite(ys)
+    xs, ys = xs[finite], ys[finite]
+
+    min_x, max_x = float(xs.min()), float(xs.max())
+    min_y, max_y = float(ys.min()), float(ys.max())
+
+    origin_x = math.floor(min_x / pixel_size) * pixel_size
+    origin_y = math.ceil(max_y / pixel_size) * pixel_size
+    extent_right = math.ceil(max_x / pixel_size) * pixel_size
+    extent_bottom = math.floor(min_y / pixel_size) * pixel_size
+
+    width_px = round((extent_right - origin_x) / pixel_size)
+    height_px = round((origin_y - extent_bottom) / pixel_size)
+
+    width_px = math.ceil(width_px / SHARD_SIZE) * SHARD_SIZE
+    height_px = math.ceil(height_px / SHARD_SIZE) * SHARD_SIZE
+
+    return UnifiedZoneGrid(
+        zone=zone,
+        years=years,
+        canonical_epsg=epsg,
+        origin_x=origin_x,
+        origin_y=origin_y,
+        width_px=width_px,
+        height_px=height_px,
+        pixel_size=pixel_size,
+    )
+
+
 def init_store(
     registry: "Registry",
     output_path: "str | Path | StoreLocation",
@@ -1805,9 +1876,12 @@ def init_store(
         root.attrs[_LANDMASK_ATTR] = False
 
     # Create each zone group from landmask coverage
+    # The grid is deterministic per zone (its full 6-degree UTM footprint), not
+    # sized to the tiles present, so adding tiles never changes it -- an update
+    # is a pure incremental fill, never a regenerate. We still only create zone
+    # groups for zones that actually have coverage.
     for zone_num in sorted(landmask_by_zone.keys()):
-        tile_coords = landmask_by_zone[zone_num]
-        grid = _compute_zone_grid_from_landmask(zone_num, tile_coords, years)
+        grid = _compute_zone_grid_deterministic(zone_num, years)
 
         if console:
             w_km = grid.width_px * grid.pixel_size / 1000
