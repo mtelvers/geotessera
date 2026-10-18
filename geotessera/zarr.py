@@ -1481,10 +1481,18 @@ def shard_coords_for_tiles(
 ) -> set:
     """Return the set of (shard_row, shard_col) covered by these tiles."""
     coords = set()
+    nrows = grid.height_px // SHARD_SIZE
+    ncols = grid.width_px // SHARD_SIZE
     for ti in tile_infos:
         row, col = _tile_pixel_offset(ti, grid)
-        for sr in range(row // SHARD_SIZE, (row + ti.height - 1) // SHARD_SIZE + 1):
-            for sc in range(col // SHARD_SIZE, (col + ti.width - 1) // SHARD_SIZE + 1):
+        # Clamp to the grid. floor placement (#429) can leave an east/south edge
+        # tile spanning one shard past the snapped grid; that shard has no array
+        # cells (the write already clips to width/height), so it must not be
+        # emitted — marking it in the stretch-stats mask raised IndexError (#429).
+        sr_lo, sr_hi = max(0, row // SHARD_SIZE), min(nrows - 1, (row + ti.height - 1) // SHARD_SIZE)
+        sc_lo, sc_hi = max(0, col // SHARD_SIZE), min(ncols - 1, (col + ti.width - 1) // SHARD_SIZE)
+        for sr in range(sr_lo, sr_hi + 1):
+            for sc in range(sc_lo, sc_hi + 1):
                 coords.add((sr, sc))
     return coords
 
@@ -1506,15 +1514,21 @@ def build_shard_index(
             the shard coordinates the new tiles touch.
     """
     shard_map: Dict[Tuple[int, int], List[ShardTileOverlap]] = {}
+    nrows = grid.height_px // SHARD_SIZE
+    ncols = grid.width_px // SHARD_SIZE
 
     for ti in tile_infos:
         row, col = _tile_pixel_offset(ti, grid)
         h, w = ti.height, ti.width
 
-        sr_start = row // SHARD_SIZE
-        sr_end = (row + h - 1) // SHARD_SIZE
-        sc_start = col // SHARD_SIZE
-        sc_end = (col + w - 1) // SHARD_SIZE
+        # Clamp to the grid: an edge tile can span one shard past the snapped
+        # grid after floor placement; that out-of-grid shard has no array cells
+        # (the write clips to width/height) and must not be emitted — marking it
+        # in the stretch-stats mask raised an IndexError (#429 edge case).
+        sr_start = max(0, row // SHARD_SIZE)
+        sr_end = min(nrows - 1, (row + h - 1) // SHARD_SIZE)
+        sc_start = max(0, col // SHARD_SIZE)
+        sc_end = min(ncols - 1, (col + w - 1) // SHARD_SIZE)
 
         for sr in range(sr_start, sr_end + 1):
             for sc in range(sc_start, sc_end + 1):
